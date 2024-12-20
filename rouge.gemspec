@@ -23,4 +23,5 @@ Gem::Specification.new do |s|
     "documentation_uri" => "https://rouge-ruby.github.io/docs/",
     "source_code_uri"   => "https://github.com/rouge-ruby/rouge"
   }
+  s.add_dependency "prism", ">= 1.2.0"
 end
