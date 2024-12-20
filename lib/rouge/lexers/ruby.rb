@@ -3,7 +3,7 @@
 
 module Rouge
   module Lexers
-    class Ruby < RegexLexer
+    class Ruby < Lexer
       title "Ruby"
       desc "The Ruby programming language (ruby-lang.org)"
       tag 'ruby'
@@ -19,436 +19,99 @@ module Rouge
         return true if text.shebang? 'ruby'
       end
 
-      state :symbols do
-        # symbols
-        rule %r(
-          :  # initial :
-          @{0,2} # optional ivar, for :@foo and :@@foo
-          [a-z_]\w*[!?]? # the symbol
-        )xi, Str::Symbol
+      def stream_tokens(string, &block)
+        require "prism"
 
-        # special symbols
-        rule %r(:(?:\*\*|[-+]@|[/\%&\|^`~]|\[\]=?|<<|>>|<=?>|<=?|===?)),
-          Str::Symbol
-
-        rule %r/:'(\\\\|\\'|[^'])*'/, Str::Symbol
-        rule %r/:"/, Str::Symbol, :simple_sym
+        v = RougeVisitor.new
+        Prism.parse(string).value.accept(v)
+        v.tokens.each(&block)
       end
 
-      state :sigil_strings do
-        # %-sigiled strings
-        # %(abc), %[abc], %<abc>, %.abc., %r.abc., etc
-        delimiter_map = { '{' => '}', '[' => ']', '(' => ')', '<' => '>' }
-        rule %r/%([rqswQWxiI])?([^\w\s])/ do |m|
-          open = Regexp.escape(m[2])
-          close = Regexp.escape(delimiter_map[m[2]] || m[2])
-          interp = /[rQWxI]/ === m[1] || !m[1]
-          toktype = Str::Other
+      class RougeVisitor < Prism::BasicVisitor
+        include Rouge::Token::Tokens
 
-          puts "    open: #{open.inspect}" if @debug
-          puts "    close: #{close.inspect}" if @debug
+        attr_reader :tokens
 
-          # regexes
-          if m[1] == 'r'
-            toktype = Str::Regex
-            push :regex_flags
-          end
-
-          token toktype
-
-          push do
-            uniq_chars = "#{open}#{close}".squeeze
-            uniq_chars = '' if open == close && open == "\\#"
-            rule %r/\\[##{uniq_chars}\\]/, Str::Escape
-            # nesting rules only with asymmetric delimiters
-            if open != close
-              rule %r/#{open}/ do
-                token toktype
-                push
-              end
-            end
-            rule %r/#{close}/, toktype, :pop!
-
-            if interp
-              mixin :string_intp_escaped
-              rule %r/#/, toktype
-            else
-              rule %r/[\\#]/, toktype
-            end
-
-            rule %r/[^##{uniq_chars}\\]+/m, toktype
-          end
-        end
-      end
-
-      state :strings do
-        mixin :symbols
-        rule %r/\b[a-z_]\w*?[?!]?:\s+/, Str::Symbol, :expr_start
-        rule %r/'(\\\\|\\'|[^'])*'/, Str::Single
-        rule %r/"/, Str::Double, :simple_string
-        rule %r/(?<!\.)`/, Str::Backtick, :simple_backtick
-      end
-
-      state :regex_flags do
-        rule %r/[mixounse]*/, Str::Regex, :pop!
-      end
-
-      # double-quoted string and symbol
-      [[:string, Str::Double, '"'],
-       [:sym, Str::Symbol, '"'],
-       [:backtick, Str::Backtick, '`']].each do |name, tok, fin|
-        state :"simple_#{name}" do
-          mixin :string_intp_escaped
-          rule %r/[^\\#{fin}#]+/m, tok
-          rule %r/[\\#]/, tok
-          rule %r/#{fin}/, tok, :pop!
-        end
-      end
-
-      keywords = %w(
-        BEGIN END alias begin break case defined\? do else elsif end
-        ensure for if in next redo rescue raise retry return super then
-        undef unless until when while yield
-      )
-
-      keywords_pseudo = %w(
-        loop include extend raise
-        alias_method attr catch throw private module_function
-        public protected true false nil __FILE__ __LINE__
-      )
-
-      builtins_g = %w(
-        attr_reader attr_writer attr_accessor
-
-        __id__ __send__ abort ancestors at_exit autoload binding callcc
-        caller catch chomp chop class_eval class_variables clone
-        const_defined\? const_get const_missing const_set constants
-        display dup eval exec exit extend fail fork format freeze
-        getc gets global_variables gsub hash id included_modules
-        inspect instance_eval instance_method instance_methods
-        instance_variable_get instance_variable_set instance_variables
-        lambda load local_variables loop method method_missing
-        methods module_eval name object_id open p print printf
-        private_class_method private_instance_methods private_methods proc
-        protected_instance_methods protected_methods public_class_method
-        public_instance_methods public_methods putc puts raise rand
-        readline readlines require require_relative scan select self send set_trace_func
-        singleton_methods sleep split sprintf srand sub syscall system
-        taint test throw to_a to_s trace_var trap untaint untrace_var warn
-      )
-
-      builtins_q = %w(
-        autoload block_given const_defined eql equal frozen
-        include instance_of is_a iterator kind_of method_defined
-        nil private_method_defined protected_method_defined
-        public_method_defined respond_to tainted
-      )
-
-      builtins_b = %w(chomp chop exit gsub sub)
-
-      start do
-        push :expr_start
-        @heredoc_queue = []
-      end
-
-      state :whitespace do
-        mixin :inline_whitespace
-        rule %r/\n\s*/m, Text, :expr_start
-        rule %r/#.*$/, Comment::Single
-
-        rule %r(=begin\b.*?\n=end\b)m, Comment::Multiline
-      end
-
-      state :inline_whitespace do
-        rule %r/[ \t\r]+/, Text
-      end
-
-      state :root do
-        mixin :whitespace
-        rule %r/__END__/, Comment::Preproc, :end_part
-
-        rule %r/0_?[0-7]+(?:_[0-7]+)*/, Num::Oct
-        rule %r/0x[0-9A-Fa-f]+(?:_[0-9A-Fa-f]+)*/, Num::Hex
-        rule %r/0b[01]+(?:_[01]+)*/, Num::Bin
-
-        decimal = %r/[\d]+(?:_\d+)*/
-        exp = %r/e[+-]?\d+/i
-        rule %r/#{decimal}(?:\.#{decimal}#{exp}?|#{exp})/, Num::Float
-        rule decimal, Num::Integer
-
-        # names
-        rule %r/@@[a-z_]\w*/i, Name::Variable::Class
-        rule %r/@[a-z_]\w*/i, Name::Variable::Instance
-        rule %r/\$\w+/, Name::Variable::Global
-        rule %r(\$[!@&`'+~=/\\,;.<>_*\$?:"]), Name::Variable::Global
-        rule %r/\$-[0adFiIlpvw]/, Name::Variable::Global
-        rule %r/::/, Operator
-
-        mixin :strings
-
-        rule %r/(?:#{keywords.join('|')})(?=\W|$)/, Keyword, :expr_start
-        rule %r/(?:#{keywords_pseudo.join('|')})\b/, Keyword::Pseudo, :expr_start
-        rule %r/(not|and|or)\b/, Operator::Word, :expr_start
-
-        rule %r(
-          (module)
-          (\s+)
-          ([a-zA-Z_][a-zA-Z0-9_]*(::[a-zA-Z_][a-zA-Z0-9_]*)*)
-        )x do
-          groups Keyword, Text, Name::Namespace
+        def initialize
+          @tokens = []
+          @last_location = nil
         end
 
-        rule %r/(def\b)(\s*)/ do
-          groups Keyword, Text
-          push :funcname
+        def visit_program_node(node)
+          program_location = node.location
+
+          @tokens << [Text::Whitespace, "\n" * program_location.start_line]
+          @tokens << [Text::Whitespace, " " * program_location.start_column]
+          @last_location = node.location
+
+          visit_child_nodes(node)
         end
 
-        rule %r/(class\b)(\s*)/ do
-          groups Keyword, Text
-          push :classname
+        alias visit_statements_node visit_child_nodes
+
+        def visit_array_node(node)
         end
 
-        rule %r/(?:#{builtins_q.join('|')})[?]/, Name::Builtin, :expr_start
-        rule %r/(?:#{builtins_b.join('|')})!/,  Name::Builtin, :expr_start
-        rule %r/(?<!\.)(?:#{builtins_g.join('|')})\b/,
-          Name::Builtin, :method_call
-
-        mixin :has_heredocs
-
-        # `..` and `...` for ranges must have higher priority than `.`
-        # Otherwise, they will be parsed as :method_call
-        rule %r/\.{2,3}/, Operator, :expr_start
-
-        rule %r/[A-Z][a-zA-Z0-9_]*/, Name::Constant, :method_call
-        rule %r/(\.|::)(\s*)([a-z_]\w*[!?]?|[*%&^`~+-\/\[<>=])/ do
-          groups Punctuation, Text, Name::Function
-          push :method_call
+        def visit_call_node(node)
+        end
+        
+        def visit_class_node(node)
         end
 
-        rule %r/[a-zA-Z_]\w*[?!]/, Name, :expr_start
-        rule %r/[a-zA-Z_]\w*/, Name, :method_call
-        rule %r/\*\*|<<?|>>?|>=|<=|<=>|=~|={3}|!~|&&?|\|\||\./,
-          Operator, :expr_start
-        rule %r/[-+\/*%=<>&!^|~]=?/, Operator, :expr_start
-        rule(/[?]/) { token Punctuation; push :ternary; push :expr_start }
-        rule %r<[\[({,:\\;/]>, Punctuation, :expr_start
-        rule %r<[\])}]>, Punctuation
-      end
-
-      state :has_heredocs do
-        rule %r/(?<!\w)(<<[-~]?)(["`']?)([a-zA-Z_]\w*)(\2)/ do |m|
-          token Operator, m[1]
-          token Name::Constant, "#{m[2]}#{m[3]}#{m[4]}"
-          @heredoc_queue << [['<<-', '<<~'].include?(m[1]), m[3]]
-          push :heredoc_queue unless state? :heredoc_queue
+        def visit_def_node(node)
         end
 
-        rule %r/(<<[-~]?)(["'])(\2)/ do |m|
-          token Operator, m[1]
-          token Name::Constant, "#{m[2]}#{m[3]}#{m[4]}"
-          @heredoc_queue << [['<<-', '<<~'].include?(m[1]), '']
-          push :heredoc_queue unless state? :heredoc_queue
-        end
-      end
+        def visit_float_node(node)
+          append_whitespace_until(node)
 
-      state :heredoc_queue do
-        rule %r/(?=\n)/ do
-          goto :resolve_heredocs
+          @tokens << [Literal::Number::Float, node.location.slice]
+          @last_location = node.location
         end
 
-        mixin :root
-      end
-
-      state :resolve_heredocs do
-        mixin :string_intp_escaped
-
-        rule %r/\n/, Str::Heredoc, :test_heredoc
-        rule %r/[#\\\n]/, Str::Heredoc
-        rule %r/[^#\\\n]+/, Str::Heredoc
-      end
-
-      state :test_heredoc do
-        rule %r/[^#\\\n]*$/ do |m|
-          tolerant, heredoc_name = @heredoc_queue.first
-          check = tolerant ? m[0].strip : m[0].rstrip
-
-          # check if we found the end of the heredoc
-          puts "    end heredoc check #{check.inspect} = #{heredoc_name.inspect}" if @debug
-          if check == heredoc_name
-            @heredoc_queue.shift
-            # if there's no more, we're done looking.
-            pop! if @heredoc_queue.empty?
-            token Name::Constant
-          else
-            token Str::Heredoc
-          end
-
-          pop!
+        def visit_if_node(node)
         end
 
-        rule(//) { pop! }
-      end
-
-      state :funcname do
-        rule %r/\s+/, Text
-        rule %r/\(/, Punctuation, :defexpr
-        rule %r(
-          (?:([a-zA-Z_]\w*)(\.))?
-          (
-            [a-zA-Z_]\w*[!?]? |
-            \*\*? | [-+]@? | [/%&\|^`~] | \[\]=? |
-            <<? | >>? | <=>? | >= | ===?
-          )
-        )x do |m|
-          puts "matches: #{[m[0], m[1], m[2], m[3]].inspect}" if @debug
-          groups Name::Class, Operator, Name::Function
-          pop!
+        def visit_local_variable_write_node(node)
         end
 
-        rule(//) { pop! }
-      end
-
-      state :classname do
-        rule %r/\s+/, Text
-        rule %r/\w+(::\w+)+/, Name::Class
-
-        rule %r/\(/ do
-          token Punctuation
-          push :defexpr
-          push :expr_start
+        def visit_missing_node(node)
         end
 
-        # class << expr
-        rule %r/<</ do
-          token Operator
-          goto :expr_start
+        def visit_module_node(node)
         end
 
-        rule %r/[A-Z_]\w*/, Name::Class, :pop!
-
-        rule(//) { pop! }
-      end
-
-      state :ternary do
-        rule %r/(:)(\s+)/ do
-          groups Punctuation, Text
-          goto :expr_start
+        def visit_parentheses_node(node)
         end
 
-        rule %r/:(?![^#\n]*?[:\\])/ do
-          token Punctuation
-          goto :expr_start
+        def visit_range_node(node)
         end
 
-        mixin :root
-      end
+        def visit_symbol_node(node)
+          append_whitespace_until(node)
 
-      state :defexpr do
-        rule %r/(\))(\.|::)?/ do
-          groups Punctuation, Operator
-          pop!
-        end
-        rule %r/\(/ do
-          token Punctuation
-          push :defexpr
-          push :expr_start
+          @tokens << [Literal::String::Symbol, "#{node.opening}#{node.value}"]
+          @last_location = node.location
         end
 
-        mixin :root
-      end
-
-      state :in_interp do
-        rule %r/}/, Str::Interpol, :pop!
-        mixin :root
-      end
-
-      state :string_intp do
-        rule %r/[#][{]/, Str::Interpol, :in_interp
-        rule %r/#(@@?|\$)[a-z_]\w*/i, Str::Interpol
-      end
-
-      state :string_intp_escaped do
-        mixin :string_intp
-        rule %r/\\([\\abefnrstv#"']|x[a-fA-F0-9]{1,2}|[0-7]{1,3})/,
-          Str::Escape
-        rule %r/\\./, Str::Escape
-      end
-
-      state :method_call do
-        rule %r(/|%) do
-          token Operator
-          goto :expr_start
+        def visit_unless_node(node)
         end
 
-        rule(/(?=\n)/) { pop! }
-
-        rule(//) { goto :method_call_spaced }
-      end
-
-      state :method_call_spaced do
-        mixin :whitespace
-
-        rule %r([%/]=) do
-          token Operator
-          goto :expr_start
+        def visit_while_node(node)
         end
 
-        rule %r((/)(?=\S|\s*/)) do
-          token Str::Regex
-          goto :slash_regex
+        private
+
+        def append_whitespace_until(node)
+          lines_to_append = node.location.start_line - @last_location.end_line
+          return unless lines_to_append > 0
+          
+          @tokens << [Text::Whitespace, "\n" * lines_to_append]
+          
+          spaces_to_append = node.location.start_column - @last_location.end_column
+          return unless spaces_to_append > 0
+
+          @tokens << [Text::Whitespace, " " * spaces_to_append]
         end
-
-        mixin :sigil_strings
-
-        rule(%r((?=\s*/))) { pop! }
-
-        rule(/\s+/) { token Text; goto :expr_start }
-        rule(//) { pop! }
-      end
-
-      state :expr_start do
-        mixin :inline_whitespace
-
-        rule %r(/) do
-          token Str::Regex
-          goto :slash_regex
-        end
-
-        # char operator.  ?x evaulates to "x", unless there's a digit
-        # beforehand like x>=0?n[x]:""
-        rule %r(
-          [?](\\[MC]-)*     # modifiers
-          (\\([\\abefnrstv\#"']|x[a-fA-F0-9]{1,2}|[0-7]{1,3})|\S)
-          (?!\w)
-        )x, Str::Char, :pop!
-
-        # special case for using a single space.  Ruby demands that
-        # these be in a single line, otherwise it would make no sense.
-        rule %r/(\s*)(%[rqswQWxiI]? \S* )/ do
-          groups Text, Str::Other
-          pop!
-        end
-
-        mixin :sigil_strings
-
-        rule(//) { pop! }
-      end
-
-      state :slash_regex do
-        mixin :string_intp
-        rule %r(\\\\), Str::Regex
-        rule %r(\\/), Str::Regex
-        rule %r([\\#]), Str::Regex
-        rule %r([^\\/#]+)m, Str::Regex
-        rule %r(/) do
-          token Str::Regex
-          goto :regex_flags
-        end
-      end
-
-      state :end_part do
-        # eat up the rest of the stream as Comment::Preproc
-        rule %r/.+/m, Comment::Preproc, :pop!
       end
     end
   end
